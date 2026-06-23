@@ -141,16 +141,22 @@ impl Decoder {
         }
         let dst_len: usize = output.iter().map(|b| b.len()).sum();
 
-        // Find the first non-empty input buffer for reading the header.
-        let first_idx = input.iter().position(|b| !b.is_empty())
-            .ok_or(Error::Empty)?;
-        let src = input[first_idx];
-        let hdr = Header::read(src)?;
+        // Read the length-header varint, which may straddle a buffer boundary: a
+        // scattered caller can split the compressed block anywhere, including in the
+        // middle of the header, so reading it from the first fragment alone would
+        // fail. `body` is the position of the first compressed byte after the header.
+        let (decompress_len, body) = read_scattered_header(input)?;
 
-        if hdr.decompress_len > dst_len {
+        if decompress_len > MAX_INPUT_SIZE {
+            return Err(Error::TooBig {
+                given: decompress_len,
+                max: MAX_INPUT_SIZE,
+            });
+        }
+        if decompress_len as usize > dst_len {
             return Err(Error::BufferTooSmall {
                 given: dst_len as u64,
-                min: hdr.decompress_len as u64,
+                min: decompress_len,
             });
         }
 
@@ -158,16 +164,16 @@ impl Decoder {
         output.reverse();
         let mut dec = DecompressScattered {
             src_buffers: input,
-            src,
-            s: hdr.len,
-            src_index: first_idx,
+            src: input[body.buffer],
+            s: body.offset,
+            src_index: body.buffer,
             dst: output.pop().unwrap(),
             dst_buffers: output,
             result_slices: vec![],
             d: 0,
         };
         dec.decompress()?;
-        Ok(hdr.decompress_len)
+        Ok(decompress_len as usize)
     }
 }
 
@@ -657,6 +663,50 @@ impl Header {
     }
 }
 
+/// The position of the first compressed body byte after the length header: which
+/// input buffer, and the offset within it. `offset` may equal that buffer's length
+/// when the header ends exactly on a buffer boundary; the decoder advances past it.
+struct BodyStart {
+    buffer: usize,
+    offset: usize,
+}
+
+/// Read the Snappy length-header varint from scattered `input`, tolerating leading
+/// empty buffers and a varint that straddles a buffer boundary (which `Header::read`,
+/// reading a single contiguous slice, cannot). Returns the decompressed length and
+/// the position just past the header where the compressed body begins.
+fn read_scattered_header(input: &[&[u8]]) -> Result<(u64, BodyStart)> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut buffer = 0;
+    let mut offset = 0;
+    loop {
+        // Skip to the next buffer that still has bytes.
+        while buffer < input.len() && offset >= input[buffer].len() {
+            buffer += 1;
+            offset = 0;
+        }
+        if buffer >= input.len() {
+            // Ran out of input: nothing to read, or a truncated varint.
+            return Err(if value == 0 && shift == 0 {
+                Error::Empty
+            } else {
+                Error::Header
+            });
+        }
+        let byte = input[buffer][offset];
+        offset += 1;
+        let bits = ((byte & 0b0111_1111) as u64)
+            .checked_shl(shift)
+            .ok_or(Error::Header)?;
+        value |= bits;
+        if byte < 0b1000_0000 {
+            return Ok((value, BodyStart { buffer, offset }));
+        }
+        shift += 7;
+    }
+}
+
 /// A lookup table for quickly computing the various attributes derived from
 /// a tag byte. The attributes are most useful for the three "copy" tags
 /// and include the length of the copy, part of the offset (for copy 1-byte
@@ -754,5 +804,44 @@ impl TagEntry {
                 });
             };
         Ok((self.0 & 0b0000_0111_0000_0000) | trailer)
+    }
+}
+
+#[cfg(test)]
+mod scattered_tests {
+    use crate::raw::{Decoder, Encoder};
+
+    /// A compressed block split so its length-header varint straddles two input
+    /// buffers still decompresses: the header is read across buffers, not from the
+    /// first fragment alone.
+    #[test]
+    fn header_straddling_a_buffer_boundary() {
+        let original = vec![7u8; 5000];
+        let compressed = Encoder::new().compress_vec(&original).unwrap();
+
+        let input = [&compressed[..1], &compressed[1..]];
+        let mut out = vec![0u8; original.len()];
+        let n = Decoder::new()
+            .decompress_scattered(&input, vec![&mut out[..]])
+            .unwrap();
+
+        assert_eq!(n, original.len());
+        assert_eq!(out, original);
+    }
+
+    /// Leading empty fragments before a straddling header are skipped.
+    #[test]
+    fn header_after_empty_fragments() {
+        let original = vec![3u8; 9000];
+        let compressed = Encoder::new().compress_vec(&original).unwrap();
+
+        let input: [&[u8]; 4] = [&[], &compressed[..1], &[], &compressed[1..]];
+        let mut out = vec![0u8; original.len()];
+        let n = Decoder::new()
+            .decompress_scattered(&input, vec![&mut out[..]])
+            .unwrap();
+
+        assert_eq!(n, original.len());
+        assert_eq!(out, original);
     }
 }
