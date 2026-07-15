@@ -544,11 +544,30 @@ impl<'s, 'd> DecompressScattered<'s, 'd> {
         self.dst[remaining]
     }
 
-    /// Byte-by-byte copy from already-written output. Handles all boundary
-    /// cases: source in previous buffers, destination crossing buffers,
-    /// and self-referential (overlapping) copies.
+    /// Copy from already-written output. Handles all boundary cases: source
+    /// in previous buffers, destination crossing buffers, and
+    /// self-referential (overlapping) copies.
+    ///
+    /// Fast path: when the copy's source lies entirely inside the current
+    /// destination buffer and the destination fits it too, run the same
+    /// non-overlapping-chunk forward copy the contiguous decoder uses.
+    /// Everything else falls back to byte-wise.
     #[inline(never)]
     fn copy_from_output(&mut self, offset: usize, len: usize) -> Result<()> {
+        if offset <= self.d && self.d + len <= self.dst.len() {
+            let mut copied = 0;
+            while copied < len {
+                // Chunks of `offset` bytes never overlap their source; the
+                // pattern (a run repeating every `offset` bytes) grows as
+                // the destination advances.
+                let chunk = offset.min(len - copied);
+                self.dst
+                    .copy_within(self.d - offset..self.d - offset + chunk, self.d);
+                self.d += chunk;
+                copied += chunk;
+            }
+            return Ok(());
+        }
         let mut total = self.total_written();
         for _ in 0..len {
             let src_pos = total - offset;
@@ -560,7 +579,8 @@ impl<'s, 'd> DecompressScattered<'s, 'd> {
     }
 
     /// Handle a literal whose tag-length bytes or data span source buffer
-    /// boundaries. Simple byte-by-byte — not performance-critical.
+    /// boundaries: copy it in the largest chunks the current source and
+    /// destination buffers allow, advancing either as it empties.
     #[inline(never)]
     fn read_literal_across_boundaries(&mut self, read_extra: bool, len: usize) -> Result<()> {
         let mut len = len as u64;
@@ -575,9 +595,23 @@ impl<'s, 'd> DecompressScattered<'s, 'd> {
             len = (len & (WORD_MASK[byte_count] as u64)) + 1
         }
 
-        for _ in 0..len {
-            let u8 = self.read_src_byte();
-            self.write_dst_byte(u8)?;
+        let mut remaining = len as usize;
+        while remaining > 0 {
+            while self.s >= self.src.len() {
+                self.src_index += 1;
+                self.src = self.src_buffers[self.src_index];
+                self.s = 0;
+            }
+            if self.d >= self.dst.len() {
+                self.replace_destination_buffer()?;
+            }
+            let chunk = remaining
+                .min(self.src.len() - self.s)
+                .min(self.dst.len() - self.d);
+            self.dst[self.d..self.d + chunk].copy_from_slice(&self.src[self.s..self.s + chunk]);
+            self.s += chunk;
+            self.d += chunk;
+            remaining -= chunk;
         }
         Ok(())
     }
