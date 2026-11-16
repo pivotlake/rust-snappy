@@ -306,7 +306,11 @@ impl<'s, 'd> Decompress<'s, 'd> {
         let entry = TAG_LOOKUP_TABLE.entry(tag_byte);
         let offset = entry.offset(self.src, self.s)?;
         let len = entry.len();
-        self.s += entry.num_tag_bytes();
+        // A copy tag is followed by 1, 2 or 4 offset bytes for tag types 1, 2
+        // and 3. Taking that count from the tag byte keeps the table load off
+        // the path to the next tag's position.
+        let tag_type = (tag_byte & 0b0000_0011) as usize;
+        self.s += tag_type + (tag_type & (tag_type >> 1));
 
         // What we really care about here is whether `d == 0` or `d < offset`.
         // To save an extra branch, use `d < offset - 1` instead. If `d` is
