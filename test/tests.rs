@@ -572,6 +572,49 @@ fn qc_rust_decompresses_cpp() {
         .quickcheck(p as fn(_) -> _);
 }
 
+// Tests that Rust and snappy-cpp accept the same corrupted streams and
+// decompress the ones they accept to the same bytes.
+#[test]
+#[cfg(feature = "cpp")]
+fn cpp_and_rust_agree_on_corrupted_streams() {
+    use rand::{Rng, SeedableRng};
+
+    let corpora: [&[u8]; 4] = [
+        include_bytes!("../data/html"),
+        include_bytes!("../data/urls.10K"),
+        include_bytes!("../data/fireworks.jpeg"),
+        include_bytes!("../data/kppkn.gtb"),
+    ];
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED);
+    for case in 0..20_000 {
+        let corpus = corpora[case % corpora.len()];
+        let start = rng.gen_range(0, corpus.len() - 4_000);
+        let len = rng.gen_range(200, 4_000);
+        let mut compressed = press(&corpus[start..start + len]);
+        // The length header of these inputs is two bytes; the corruption
+        // stays behind it so that both decoders see the same output size.
+        if rng.gen_range(0, 8) == 0 {
+            compressed.truncate(rng.gen_range(2, compressed.len()));
+        } else {
+            for _ in 0..rng.gen_range(1, 4) {
+                let position = rng.gen_range(2, compressed.len());
+                compressed[position] = rng.gen();
+            }
+        }
+        let mut output_rust = vec![0; len];
+        let mut output_cpp = vec![0; len];
+
+        let result_rust =
+            Decoder::new().decompress(&compressed, &mut output_rust);
+        let result_cpp = cpp::decompress(&compressed, &mut output_cpp);
+
+        assert_eq!(result_rust.is_ok(), result_cpp.is_ok(), "case {}", case);
+        if result_rust.is_ok() {
+            assert_eq!(output_rust, output_cpp, "case {}", case);
+        }
+    }
+}
+
 // Regression tests.
 
 // See: https://github.com/BurntSushi/rust-snappy/issues/3

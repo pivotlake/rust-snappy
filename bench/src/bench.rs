@@ -67,6 +67,7 @@ macro_rules! decompress {
 
 fn all(c: &mut Criterion) {
     rust(c);
+    rust_scattered(c);
     #[cfg(feature = "cpp")]
     cpp(c);
 }
@@ -112,6 +113,55 @@ fn rust(c: &mut Criterion) {
     decompress!(c, decompress, "snap", "uflat09_txt4", CORPUS_PLRABN12);
     decompress!(c, decompress, "snap", "uflat10_pb", CORPUS_GEOPROTO);
     decompress!(c, decompress, "snap", "uflat11_gaviota", CORPUS_KPPKN);
+}
+
+/// Benchmarks `decompress_scattered` on every corpus, with the compressed
+/// bytes and the output space each cut into buffers of a fixed size.
+fn rust_scattered(c: &mut Criterion) {
+    // (name, bytes per input buffer, bytes per output buffer)
+    let shapes: [(&str, usize, usize); 3] = [
+        ("whole", usize::MAX, usize::MAX),
+        ("in64k_out64k", 64 << 10, 64 << 10),
+        ("in4k_out16k", 4 << 10, 16 << 10),
+    ];
+    let corpora: [(&str, &'static [u8]); 12] = [
+        ("uflat00_html", CORPUS_HTML),
+        ("uflat01_urls", CORPUS_URLS_10K),
+        ("uflat02_jpg", CORPUS_FIREWORKS),
+        ("uflat03_jpg_200", &CORPUS_FIREWORKS[..200]),
+        ("uflat04_pdf", CORPUS_PAPER_100K),
+        ("uflat05_html4", CORPUS_HTML_X_4),
+        ("uflat06_txt1", CORPUS_ALICE29),
+        ("uflat07_txt2", CORPUS_ASYOULIK),
+        ("uflat08_txt3", CORPUS_LCET10),
+        ("uflat09_txt4", CORPUS_PLRABN12),
+        ("uflat10_pb", CORPUS_GEOPROTO),
+        ("uflat11_gaviota", CORPUS_KPPKN),
+    ];
+    for &(shape, input_buffer_len, output_buffer_len) in &shapes {
+        for &(name, corpus) in &corpora {
+            let compressed =
+                snap::raw::Encoder::new().compress_vec(corpus).unwrap();
+            let mut dst = vec![0; corpus.len()];
+            define(
+                c,
+                "snap",
+                &format!("decompress_scattered/{}/{}", shape, name),
+                corpus,
+                move |b| {
+                    let input: Vec<&[u8]> =
+                        compressed.chunks(input_buffer_len).collect();
+                    b.iter(|| {
+                        let output: Vec<&mut [u8]> =
+                            dst.chunks_mut(output_buffer_len).collect();
+                        snap::raw::Decoder::new()
+                            .decompress_scattered(&input, output)
+                            .unwrap();
+                    });
+                },
+            );
+        }
+    }
 }
 
 #[cfg(feature = "cpp")]
