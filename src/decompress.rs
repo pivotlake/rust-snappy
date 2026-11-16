@@ -294,8 +294,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
     }
 
     /// Decompresses elements for as long as the input and the output both
-    /// have twice `SLOP_BYTES` to spare, with no branch on whether an
-    /// element is a literal or a copy.
+    /// have `SLOP_BYTES` to spare, with no branch on whether an element is a
+    /// literal or a copy.
     ///
     /// It stops, with `s` at an element's tag byte and `d` at the position
     /// that element writes to, in front of the first element that is too
@@ -306,11 +306,15 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// decompresses the element this stopped at.
     #[inline(always)]
     fn decompress_branchless(&mut self) {
-        // The loop decompresses two elements per check of these limits, so
-        // it needs twice the spare room of one element.
-        let ip_limit_min_slop =
-            self.src.len().saturating_sub(2 * SLOP_BYTES + 1);
+        // The limits below which there is room for one element.
+        let ip_limit_min_slop = self.src.len().saturating_sub(SLOP_BYTES);
         let op_limit_min_slop =
+            self.dst.len().saturating_sub(SLOP_BYTES - 1) as isize;
+        // The limits below which there is room for two elements, which is
+        // what the loop that checks once per two elements needs.
+        let ip_limit_min_two_slops =
+            self.src.len().saturating_sub(2 * SLOP_BYTES + 1);
+        let op_limit_min_two_slops =
             self.dst.len().saturating_sub(2 * SLOP_BYTES - 1) as isize;
         if self.s + 1 >= ip_limit_min_slop
             || self.d as isize >= op_limit_min_slop
@@ -320,13 +324,13 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // SAFETY: `ip` is the position after the current element's tag
         // byte. `op` is the position the deferred copy writes to, and
         // `op + deferred_length`, called `end` here, is the position the
-        // current element's output starts at. Before every pair of elements
-        // `ip < src.len() - 2 * SLOP_BYTES - 1` and
-        // `end <= dst.len() - 2 * SLOP_BYTES`: the check above establishes
-        // that and the loop condition keeps it. The first element of a pair
-        // moves `ip` by at most 65 and `end` by at most 64, so every element
-        // starts with `ip < src.len() - SLOP_BYTES` and
-        // `end <= dst.len() - SLOP_BYTES`.
+        // current element's output starts at. Every element starts with
+        // `ip < src.len() - SLOP_BYTES` and `end <= dst.len() - SLOP_BYTES`.
+        // The loop of single elements checks exactly that before each one.
+        // The loop of pairs checks `ip < src.len() - 2 * SLOP_BYTES - 1` and
+        // `end <= dst.len() - 2 * SLOP_BYTES` before each pair, and the
+        // first element of a pair moves `ip` by at most 65 and `end` by at
+        // most 64.
         //
         // Reads of `src`: `advance_to_next_tag` reads at most `ip[64]`,
         // `load_u16_le` reads `ip[..2]` and a literal's `mem_copy_64` reads
@@ -355,6 +359,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let ip_base = self.src.as_ptr();
             let op_base = self.dst.as_mut_ptr();
             let ip_limit_min_slop = ip_base.add(ip_limit_min_slop);
+            let ip_limit_min_two_slops = ip_base.add(ip_limit_min_two_slops);
             let mut ip = ip_base.add(self.s + 1);
             let mut tag = *ip.sub(1) as usize;
             let mut op = self.d as isize;
@@ -365,10 +370,12 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let safe_source = [0u8; 64];
             let mut deferred_src = safe_source.as_ptr();
             let mut deferred_length = 0isize;
-            'elements: loop {
-                // Two elements per check of the limits: fewer instructions
-                // spent on checking, and fewer moves between registers.
-                for _ in 0..2 {
+            // Decompresses one element, or leaves the block labelled
+            // `$elements` with `ip` back at the element it does not handle.
+            // A macro and not a function, so that both loops below get the
+            // element's code laid out in line, with its state in registers.
+            macro_rules! decompress_element {
+                ($elements:lifetime) => {{
                     let old_ip = ip;
                     let len_minus_offset = LENGTH_MINUS_OFFSET.0[tag] as isize;
                     let tag_type = advance_to_next_tag(&mut ip, &mut tag);
@@ -384,7 +391,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                             // A literal whose length follows the tag, or a
                             // copy with a four byte offset.
                             ip = old_ip;
-                            break 'elements;
+                            break $elements;
                         }
                         // A copy with a one or two byte offset that overlaps
                         // its own output: its bytes repeat with the offset
@@ -408,7 +415,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         {
                             // It starts before `dst`, or its offset is zero.
                             ip = old_ip;
-                            break 'elements;
+                            break $elements;
                         }
                         // This copy is not deferred, so its length is added
                         // right away.
@@ -423,7 +430,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         hint::cold_path();
                         if tag_type != 0 {
                             ip = old_ip;
-                            break 'elements;
+                            break $elements;
                         }
                         old_ip
                     } else {
@@ -444,11 +451,25 @@ impl<'s, 'd> Decompress<'s, 'd> {
                     op += deferred_length;
                     deferred_src = from;
                     deferred_length = len;
-                }
-                if ip >= ip_limit_min_slop
-                    || op + deferred_length >= op_limit_min_slop
+                }};
+            }
+            'elements: {
+                // Two elements per check of the limits: fewer instructions
+                // spent on checking, and fewer moves between registers.
+                while ip < ip_limit_min_two_slops
+                    && op + deferred_length < op_limit_min_two_slops
                 {
-                    break;
+                    for _ in 0..2 {
+                        decompress_element!('elements);
+                    }
+                }
+                // One element per check where there is room for one element
+                // but not for two: the last stretch of a buffer, or all of
+                // a small one.
+                while ip < ip_limit_min_slop
+                    && op + deferred_length < op_limit_min_slop
+                {
+                    decompress_element!('elements);
                 }
             }
             if deferred_length != 0 {
