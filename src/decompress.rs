@@ -3,6 +3,7 @@ use crate::bytes;
 use crate::error::{Error, Result};
 use crate::tag;
 use crate::MAX_INPUT_SIZE;
+use std::hint;
 
 /// A lookup table for quickly computing the various attributes derived from a
 /// tag byte.
@@ -14,6 +15,69 @@ const TAG_LOOKUP_TABLE: TagLookupTable = TagLookupTable(tag::TAG_LOOKUP_TABLE);
 /// this case, we can read a 32 bit little endian integer and mask out only the
 /// bits we need. This in particular saves a branch.
 const WORD_MASK: [usize; 5] = [0, 0xFF, 0xFFFF, 0xFFFFFF, 0xFFFFFFFF];
+
+/// `SLOP_BYTES` is how far one element of `decompress_branchless` may reach:
+/// it reads at most this many bytes after its tag byte and one byte more for
+/// the next tag, and it writes at most this many bytes from the position its
+/// output starts at.
+const SLOP_BYTES: usize = 64;
+
+/// A table that translates a tag byte into a form that takes few
+/// instructions to decode: the element's length minus the part of a copy's
+/// offset that the tag byte holds, shifted to where the offset bytes that
+/// follow the tag complete it. The low byte of an entry is the length, and
+/// subtracting the offset bytes from an entry gives length minus offset,
+/// whose sign tells whether a copy overlaps its own output.
+///
+/// A literal has no offset, so its entry carries a made-up offset of 256
+/// that keeps it out of the overlap case. A literal whose length follows the
+/// tag and a copy with a four byte offset have the entry `0xFF`: no offset
+/// bytes are subtracted for them, so they always look like an overlap, and
+/// bit 7 of their length sets them apart from a real one.
+#[repr(align(64))]
+struct LengthMinusOffsetTable([i16; 256]);
+
+static LENGTH_MINUS_OFFSET: LengthMinusOffsetTable =
+    LengthMinusOffsetTable(make_length_minus_offset_table());
+
+// What `decompress_branchless` relies on for its bounds: an entry either
+// holds a length of 1 to 64, or it is `0xFF` and belongs to a tag whose
+// offset bytes are not subtracted from it (types 0 and 3), so that it always
+// leaves the loop.
+const _: () = {
+    let table = make_length_minus_offset_table();
+    let mut tag = 0;
+    while tag < 256 {
+        let len = table[tag] & 0xFF;
+        if table[tag] == 0xFF {
+            assert!(tag & 3 == 0 || tag & 3 == 3);
+        } else {
+            assert!(1 <= len && len <= 64);
+        }
+        tag += 1;
+    }
+};
+
+const fn make_length_minus_offset_table() -> [i16; 256] {
+    let mut table = [0i16; 256];
+    let mut tag = 0;
+    while tag < 256 {
+        let data = (tag >> 2) as i16;
+        table[tag] = match tag & 3 {
+            // A literal, with the made-up offset.
+            0 if data < 60 => (data + 1) - (1 << 8),
+            // A copy with a one byte offset.
+            1 => ((data & 7) + 4) - ((data >> 3) << 8),
+            // A copy with a two byte offset.
+            2 => data + 1,
+            // A literal whose length follows the tag, or a copy with a four
+            // byte offset.
+            _ => 0xFF,
+        };
+        tag += 1;
+    }
+    table
+}
 
 /// Returns the decompressed size (in bytes) of the compressed bytes given.
 ///
@@ -197,7 +261,11 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// Process all tags in the current src buffer.
     #[inline(always)]
     fn decompress_tags(&mut self) -> Result<()> {
-        while self.s < self.src.len() {
+        loop {
+            self.decompress_branchless();
+            if self.s >= self.src.len() {
+                return Ok(());
+            }
             let byte = self.src[self.s];
             self.s += 1;
             if byte & 0b000000_11 == 0 {
@@ -223,7 +291,101 @@ impl<'s, 'd> Decompress<'s, 'd> {
                 self.read_copy(byte)?;
             }
         }
-        Ok(())
+    }
+
+    /// Decompresses elements for as long as the input and the output both
+    /// have `SLOP_BYTES` to spare, with no branch on whether an element is a
+    /// literal or a copy.
+    ///
+    /// It stops, with `s` at an element's tag byte and `d` at the position
+    /// that element writes to, in front of the first element that is too
+    /// close to the end of the input or the output, or that it leaves to
+    /// the caller: a literal whose length follows the tag, a copy with a
+    /// four byte offset, a copy that overlaps its own output and a copy
+    /// that starts before `dst`. It reports no errors; the caller finds
+    /// them when it decompresses the element this stopped at.
+    #[inline(always)]
+    fn decompress_branchless(&mut self) {
+        let ip_limit_min_slop = self.src.len().saturating_sub(SLOP_BYTES);
+        let op_limit_min_slop =
+            self.dst.len().saturating_sub(SLOP_BYTES - 1) as isize;
+        if self.s + 1 >= ip_limit_min_slop
+            || self.d as isize >= op_limit_min_slop
+        {
+            return;
+        }
+        // SAFETY: `ip` is the position after the current element's tag byte
+        // and `op` the position its output starts at. At the top of every
+        // iteration `ip < src.len() - SLOP_BYTES` and
+        // `op <= dst.len() - SLOP_BYTES`: the check above establishes that
+        // and the loop condition keeps it.
+        //
+        // Reads of `src`: `advance_to_next_tag` reads at most `ip[64]`,
+        // `load_u16_le` reads `ip[..2]` and a literal's `mem_copy_64` reads
+        // `ip[..64]`, all below `src.len()`. `ip` advances by at most 65,
+        // so it never passes `src.len()`, and the byte before it, which is
+        // the next element's tag byte, is in `src`.
+        //
+        // Reads and writes of `dst`: `mem_copy_64` writes `dst[op..op + 64]`,
+        // which the bound on `op` keeps inside `dst`. A copy reads
+        // `dst[delta..delta + 64]` with `0 <= delta < op`, checked before
+        // its address is formed. Every length that reaches `mem_copy_64` is
+        // at most 64, because an entry of `LENGTH_MINUS_OFFSET` other than
+        // `0xFF` holds one, and `0xFF` leaves the loop before any copy.
+        unsafe {
+            let ip_base = self.src.as_ptr();
+            let op_base = self.dst.as_mut_ptr();
+            let ip_limit_min_slop = ip_base.add(ip_limit_min_slop);
+            let mut ip = ip_base.add(self.s + 1);
+            let mut tag = *ip.sub(1) as usize;
+            let mut op = self.d as isize;
+            loop {
+                let old_ip = ip;
+                let len_minus_offset = LENGTH_MINUS_OFFSET.0[tag] as isize;
+                let tag_type = advance_to_next_tag(&mut ip, &mut tag);
+                let next = load_u16_le(old_ip) as usize;
+                let len = len_minus_offset & 0xFF;
+                let extracted = extract_offset(next, tag_type) as isize;
+                // Length minus offset. The subtraction that produces it also
+                // sets the flags for the test below.
+                let len_min_offset = len_minus_offset - extracted;
+                if len_min_offset > 0 {
+                    // A copy that overlaps its own output, or one of the
+                    // elements that the table sends here.
+                    hint::cold_path();
+                    ip = old_ip;
+                    break;
+                }
+                let delta = op + len_min_offset - len;
+                let from = if delta < 0 {
+                    // A copy that starts before `dst`, or a literal: its
+                    // made-up offset gives it a negative `delta` while `op`
+                    // is below 256.
+                    hint::cold_path();
+                    if tag_type != 0 {
+                        ip = old_ip;
+                        break;
+                    }
+                    old_ip
+                } else {
+                    // A copy takes its bytes from `dst`, a literal from
+                    // `src`; only the address differs, and it is selected,
+                    // not branched on.
+                    hint::select_unpredictable(
+                        tag_type != 0,
+                        op_base.offset(delta) as *const u8,
+                        old_ip,
+                    )
+                };
+                mem_copy_64(op_base.offset(op), from, len as usize);
+                op += len;
+                if ip >= ip_limit_min_slop || op >= op_limit_min_slop {
+                    break;
+                }
+            }
+            self.s = ip.offset_from(ip_base) as usize - 1;
+            self.d = op as usize;
+        }
     }
 
     fn decompress(&mut self) -> Result<()> {
@@ -417,6 +579,86 @@ impl<'s, 'd> Decompress<'s, 'd> {
         self.d = end;
         Ok(())
     }
+}
+
+/// Moves `ip` from the position after one tag byte to the position after
+/// the next one, loads that next tag into `tag` and returns the type of the
+/// tag it moved past (its low two bits).
+///
+/// The time per element of `decompress_branchless` is bounded from below by
+/// this chain: the tag byte gives the distance to the next tag byte, whose
+/// load gives the distance after that. Both candidate distances are
+/// computed and one is selected, so no branch has to guess the kind of the
+/// element, and the next tag is loaded here, before the element is copied.
+///
+/// For the two elements that leave `decompress_branchless` the result is not
+/// the next tag: a literal whose length follows the tag is treated as
+/// having the length its tag byte would encode (61 to 64), and a copy with a
+/// four byte offset as having three offset bytes.
+///
+/// # Safety
+///
+/// `ip[..65]` must be readable and `tag` must be below 256.
+#[inline(always)]
+unsafe fn advance_to_next_tag(ip: &mut *const u8, tag: &mut usize) -> usize {
+    let tag_type = *tag & 3;
+    let next_tag_offset =
+        if tag_type == 0 { (*tag >> 2) + 1 } else { tag_type };
+    *tag = *ip.add(next_tag_offset) as usize;
+    *ip = ip.add(next_tag_offset + 1);
+    tag_type
+}
+
+/// Returns the offset bytes of a copy with a one or two byte offset out of
+/// `val`, the two bytes after its tag, and 0 for a literal or for a copy
+/// with a four byte offset.
+///
+/// `val` must be below 65536: only the low 16 bits of the shifted constant
+/// are a mask, and a `val` that has no higher bits needs no instruction to
+/// drop the rest.
+#[inline(always)]
+fn extract_offset(val: usize, tag_type: usize) -> usize {
+    // One 16 bit mask per tag type, the mask of type 0 in the low bits.
+    const EXTRACT_MASKS_COMBINED: u64 = 0x0000_FFFF_00FF_0000;
+    val & (EXTRACT_MASKS_COMBINED >> (tag_type * 16)) as usize
+}
+
+/// Copies `size` bytes, at most 64, from `src` to `dst`. It may copy more
+/// than `size` bytes, but never more than 64, because copies of a fixed size
+/// need no loop and no branch on `size` beyond the one below.
+///
+/// # Safety
+///
+/// `src[..64]` must be readable and `dst[..64]` writable. The two ranges may
+/// overlap, but `src[..size]` and `dst[..size]` must not.
+#[inline(always)]
+unsafe fn mem_copy_64(dst: *mut u8, src: *const u8, size: usize) {
+    // Always copy this many bytes; when that is less than `size`, copy all
+    // 64. Nearly all copies are short.
+    const SHORT_MEM_COPY: usize = 32;
+    debug_assert!(size <= 64);
+    // The ranges are `size` bytes apart, but with more than `size` bytes
+    // copied they can still overlap, so each block is loaded whole before it
+    // is stored.
+    ptr::copy(src, dst, SHORT_MEM_COPY);
+    if size > SHORT_MEM_COPY {
+        hint::cold_path();
+        ptr::copy(
+            src.add(SHORT_MEM_COPY),
+            dst.add(SHORT_MEM_COPY),
+            64 - SHORT_MEM_COPY,
+        );
+    }
+}
+
+/// Does an unaligned load of a little endian encoded u16.
+///
+/// # Safety
+///
+/// `data[..2]` must be readable.
+#[inline(always)]
+unsafe fn load_u16_le(data: *const u8) -> u16 {
+    (data as *const u16).read_unaligned().to_le()
 }
 
 /// DecompressScattered is the state for decompressing from/to scattered
@@ -801,6 +1043,7 @@ impl TagEntry {
     ///
     /// This requires reading from the compressed input since the offset is
     /// encoded in bytes proceding the tag byte.
+    #[inline(always)]
     fn offset(&self, src: &[u8], s: usize) -> Result<usize> {
         let num_tag_bytes = self.num_tag_bytes();
         let trailer =
