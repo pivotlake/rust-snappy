@@ -314,26 +314,36 @@ impl<'s, 'd> Decompress<'s, 'd> {
         {
             return;
         }
-        // SAFETY: `ip` is the position after the current element's tag byte
-        // and `op` the position its output starts at. At the top of every
-        // iteration `ip < src.len() - SLOP_BYTES` and
-        // `op <= dst.len() - SLOP_BYTES`: the check above establishes that
-        // and the loop condition keeps it.
+        // SAFETY: `ip` is the position after the current element's tag
+        // byte. `op` is the position the deferred copy writes to, and
+        // `op + deferred_length`, called `end` here, is the position the
+        // current element's output starts at. At the top of every iteration
+        // `ip < src.len() - SLOP_BYTES` and `end <= dst.len() - SLOP_BYTES`:
+        // the check above establishes that and the loop condition keeps it.
         //
         // Reads of `src`: `advance_to_next_tag` reads at most `ip[64]`,
         // `load_u16_le` reads `ip[..2]` and a literal's `mem_copy_64` reads
-        // `ip[..64]`, all below `src.len()`. `ip` advances by at most 65,
-        // so it never passes `src.len()`, and the byte before it, which is
-        // the next element's tag byte, is in `src`.
+        // `ip[..64]`, all below `src.len()`. That copy is performed later,
+        // but from the same address. `ip` advances by at most 65, so it
+        // never passes `src.len()`, and the byte before it, which is the
+        // next element's tag byte, is in `src`.
         //
-        // Reads and writes of `dst`: `mem_copy_64` and
-        // `copy_64_bytes_with_pattern_extension` write `dst[op..op + 64]`,
-        // which the bound on `op` keeps inside `dst`. A copy reads from
-        // `dst[delta]` on, where `delta` is `op` minus the copy's offset, up
-        // to `dst[op + 64]` at most, and only after `0 <= delta` has been
-        // checked. Every length that reaches a copy is at most 64, because
-        // an entry of `LENGTH_MINUS_OFFSET` other than `0xFF` holds one, and
-        // `0xFF` leaves the loop before any copy.
+        // Writes of `dst`: the deferred copy writes `dst[op..op + 64]` with
+        // `op <= end`. The current element writes `dst[end..end + 64]`,
+        // at once through `copy_64_bytes_with_pattern_extension` or as the
+        // next deferred copy, which is performed in the next iteration or
+        // after the loop. All of it lies below `end + 64 <= dst.len()`.
+        // While nothing is deferred, `deferred_src` is a local buffer of 64
+        // bytes and the copy of length zero writes 32 of them at `op`, which
+        // is `end`. After the loop that copy is skipped, because there `end`
+        // may be less than 32 bytes from the end of `dst`.
+        //
+        // Reads of `dst`: a copy reads from `dst[delta]` on, where `delta`
+        // is `end` minus the copy's offset, up to `dst[end + 64]` at most,
+        // and only after `0 <= delta` has been checked. Every length that
+        // reaches a copy is at most 64, because an entry of
+        // `LENGTH_MINUS_OFFSET` other than `0xFF` holds one, and `0xFF`
+        // leaves the loop before any copy.
         unsafe {
             let ip_base = self.src.as_ptr();
             let op_base = self.dst.as_mut_ptr();
@@ -341,6 +351,13 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let mut ip = ip_base.add(self.s + 1);
             let mut tag = *ip.sub(1) as usize;
             let mut op = self.d as isize;
+            // The copy that the previous element asked for. It is performed
+            // at the start of the next element, when the addresses and the
+            // length it needs have long been computed. With nothing
+            // deferred it is a copy of length zero from `safe_source`.
+            let safe_source = [0u8; 64];
+            let mut deferred_src = safe_source.as_ptr();
+            let mut deferred_length = 0isize;
             'elements: loop {
                 'element: {
                     let old_ip = ip;
@@ -362,8 +379,18 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         }
                         // A copy with a one or two byte offset that overlaps
                         // its own output: its bytes repeat with the offset
-                        // as their period.
-                        let delta = op + len_min_offset - len;
+                        // as their period. It reads what the deferred copy
+                        // writes, so that one is performed first.
+                        let delta =
+                            (op + deferred_length) + len_min_offset - len;
+                        mem_copy_64(
+                            op_base.offset(op),
+                            deferred_src,
+                            deferred_length as usize,
+                        );
+                        op += deferred_length;
+                        deferred_src = safe_source.as_ptr();
+                        deferred_length = 0;
                         if delta < 0
                             || !copy_64_bytes_with_pattern_extension(
                                 op_base.offset(op),
@@ -374,10 +401,12 @@ impl<'s, 'd> Decompress<'s, 'd> {
                             ip = old_ip;
                             break 'elements;
                         }
+                        // This copy is not deferred, so its length is added
+                        // right away.
                         op += len;
                         break 'element;
                     }
-                    let delta = op + len_min_offset - len;
+                    let delta = (op + deferred_length) + len_min_offset - len;
                     let from = if delta < 0 {
                         // A copy that starts before `dst`, or a literal: its
                         // made-up offset gives it a negative `delta` while
@@ -398,12 +427,28 @@ impl<'s, 'd> Decompress<'s, 'd> {
                             old_ip,
                         )
                     };
-                    mem_copy_64(op_base.offset(op), from, len as usize);
-                    op += len;
+                    mem_copy_64(
+                        op_base.offset(op),
+                        deferred_src,
+                        deferred_length as usize,
+                    );
+                    op += deferred_length;
+                    deferred_src = from;
+                    deferred_length = len;
                 }
-                if ip >= ip_limit_min_slop || op >= op_limit_min_slop {
+                if ip >= ip_limit_min_slop
+                    || op + deferred_length >= op_limit_min_slop
+                {
                     break;
                 }
+            }
+            if deferred_length != 0 {
+                mem_copy_64(
+                    op_base.offset(op),
+                    deferred_src,
+                    deferred_length as usize,
+                );
+                op += deferred_length;
             }
             self.s = ip.offset_from(ip_base) as usize - 1;
             self.d = op as usize;
