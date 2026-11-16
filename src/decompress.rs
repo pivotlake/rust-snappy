@@ -294,8 +294,8 @@ impl<'s, 'd> Decompress<'s, 'd> {
     }
 
     /// Decompresses elements for as long as the input and the output both
-    /// have `SLOP_BYTES` to spare, with no branch on whether an element is a
-    /// literal or a copy.
+    /// have twice `SLOP_BYTES` to spare, with no branch on whether an
+    /// element is a literal or a copy.
     ///
     /// It stops, with `s` at an element's tag byte and `d` at the position
     /// that element writes to, in front of the first element that is too
@@ -306,9 +306,12 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// decompresses the element this stopped at.
     #[inline(always)]
     fn decompress_branchless(&mut self) {
-        let ip_limit_min_slop = self.src.len().saturating_sub(SLOP_BYTES);
+        // The loop decompresses two elements per check of these limits, so
+        // it needs twice the spare room of one element.
+        let ip_limit_min_slop =
+            self.src.len().saturating_sub(2 * SLOP_BYTES + 1);
         let op_limit_min_slop =
-            self.dst.len().saturating_sub(SLOP_BYTES - 1) as isize;
+            self.dst.len().saturating_sub(2 * SLOP_BYTES - 1) as isize;
         if self.s + 1 >= ip_limit_min_slop
             || self.d as isize >= op_limit_min_slop
         {
@@ -317,9 +320,13 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // SAFETY: `ip` is the position after the current element's tag
         // byte. `op` is the position the deferred copy writes to, and
         // `op + deferred_length`, called `end` here, is the position the
-        // current element's output starts at. At the top of every iteration
-        // `ip < src.len() - SLOP_BYTES` and `end <= dst.len() - SLOP_BYTES`:
-        // the check above establishes that and the loop condition keeps it.
+        // current element's output starts at. Before every pair of elements
+        // `ip < src.len() - 2 * SLOP_BYTES - 1` and
+        // `end <= dst.len() - 2 * SLOP_BYTES`: the check above establishes
+        // that and the loop condition keeps it. The first element of a pair
+        // moves `ip` by at most 65 and `end` by at most 64, so every element
+        // starts with `ip < src.len() - SLOP_BYTES` and
+        // `end <= dst.len() - SLOP_BYTES`.
         //
         // Reads of `src`: `advance_to_next_tag` reads at most `ip[64]`,
         // `load_u16_le` reads `ip[..2]` and a literal's `mem_copy_64` reads
@@ -359,7 +366,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let mut deferred_src = safe_source.as_ptr();
             let mut deferred_length = 0isize;
             'elements: loop {
-                'element: {
+                // Two elements per check of the limits: fewer instructions
+                // spent on checking, and fewer moves between registers.
+                for _ in 0..2 {
                     let old_ip = ip;
                     let len_minus_offset = LENGTH_MINUS_OFFSET.0[tag] as isize;
                     let tag_type = advance_to_next_tag(&mut ip, &mut tag);
@@ -404,7 +413,7 @@ impl<'s, 'd> Decompress<'s, 'd> {
                         // This copy is not deferred, so its length is added
                         // right away.
                         op += len;
-                        break 'element;
+                        continue;
                     }
                     let delta = (op + deferred_length) + len_min_offset - len;
                     let from = if delta < 0 {
