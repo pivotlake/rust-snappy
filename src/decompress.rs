@@ -301,9 +301,9 @@ impl<'s, 'd> Decompress<'s, 'd> {
     /// that element writes to, in front of the first element that is too
     /// close to the end of the input or the output, or that it leaves to
     /// the caller: a literal whose length follows the tag, a copy with a
-    /// four byte offset, a copy that overlaps its own output and a copy
-    /// that starts before `dst`. It reports no errors; the caller finds
-    /// them when it decompresses the element this stopped at.
+    /// four byte offset, a copy with offset zero and a copy that starts
+    /// before `dst`. It reports no errors; the caller finds them when it
+    /// decompresses the element this stopped at.
     #[inline(always)]
     fn decompress_branchless(&mut self) {
         let ip_limit_min_slop = self.src.len().saturating_sub(SLOP_BYTES);
@@ -326,12 +326,14 @@ impl<'s, 'd> Decompress<'s, 'd> {
         // so it never passes `src.len()`, and the byte before it, which is
         // the next element's tag byte, is in `src`.
         //
-        // Reads and writes of `dst`: `mem_copy_64` writes `dst[op..op + 64]`,
-        // which the bound on `op` keeps inside `dst`. A copy reads
-        // `dst[delta..delta + 64]` with `0 <= delta < op`, checked before
-        // its address is formed. Every length that reaches `mem_copy_64` is
-        // at most 64, because an entry of `LENGTH_MINUS_OFFSET` other than
-        // `0xFF` holds one, and `0xFF` leaves the loop before any copy.
+        // Reads and writes of `dst`: `mem_copy_64` and
+        // `copy_64_bytes_with_pattern_extension` write `dst[op..op + 64]`,
+        // which the bound on `op` keeps inside `dst`. A copy reads from
+        // `dst[delta]` on, where `delta` is `op` minus the copy's offset, up
+        // to `dst[op + 64]` at most, and only after `0 <= delta` has been
+        // checked. Every length that reaches a copy is at most 64, because
+        // an entry of `LENGTH_MINUS_OFFSET` other than `0xFF` holds one, and
+        // `0xFF` leaves the loop before any copy.
         unsafe {
             let ip_base = self.src.as_ptr();
             let op_base = self.dst.as_mut_ptr();
@@ -339,46 +341,66 @@ impl<'s, 'd> Decompress<'s, 'd> {
             let mut ip = ip_base.add(self.s + 1);
             let mut tag = *ip.sub(1) as usize;
             let mut op = self.d as isize;
-            loop {
-                let old_ip = ip;
-                let len_minus_offset = LENGTH_MINUS_OFFSET.0[tag] as isize;
-                let tag_type = advance_to_next_tag(&mut ip, &mut tag);
-                let next = load_u16_le(old_ip) as usize;
-                let len = len_minus_offset & 0xFF;
-                let extracted = extract_offset(next, tag_type) as isize;
-                // Length minus offset. The subtraction that produces it also
-                // sets the flags for the test below.
-                let len_min_offset = len_minus_offset - extracted;
-                if len_min_offset > 0 {
-                    // A copy that overlaps its own output, or one of the
-                    // elements that the table sends here.
-                    hint::cold_path();
-                    ip = old_ip;
-                    break;
-                }
-                let delta = op + len_min_offset - len;
-                let from = if delta < 0 {
-                    // A copy that starts before `dst`, or a literal: its
-                    // made-up offset gives it a negative `delta` while `op`
-                    // is below 256.
-                    hint::cold_path();
-                    if tag_type != 0 {
-                        ip = old_ip;
-                        break;
+            'elements: loop {
+                'element: {
+                    let old_ip = ip;
+                    let len_minus_offset = LENGTH_MINUS_OFFSET.0[tag] as isize;
+                    let tag_type = advance_to_next_tag(&mut ip, &mut tag);
+                    let next = load_u16_le(old_ip) as usize;
+                    let len = len_minus_offset & 0xFF;
+                    let extracted = extract_offset(next, tag_type) as isize;
+                    // Length minus offset. The subtraction that produces it
+                    // also sets the flags for the test below.
+                    let len_min_offset = len_minus_offset - extracted;
+                    if len_min_offset > 0 {
+                        hint::cold_path();
+                        if len & 0x80 != 0 {
+                            // A literal whose length follows the tag, or a
+                            // copy with a four byte offset.
+                            ip = old_ip;
+                            break 'elements;
+                        }
+                        // A copy with a one or two byte offset that overlaps
+                        // its own output: its bytes repeat with the offset
+                        // as their period.
+                        let delta = op + len_min_offset - len;
+                        if delta < 0
+                            || !copy_64_bytes_with_pattern_extension(
+                                op_base.offset(op),
+                                (len - len_min_offset) as usize,
+                            )
+                        {
+                            // It starts before `dst`, or its offset is zero.
+                            ip = old_ip;
+                            break 'elements;
+                        }
+                        op += len;
+                        break 'element;
                     }
-                    old_ip
-                } else {
-                    // A copy takes its bytes from `dst`, a literal from
-                    // `src`; only the address differs, and it is selected,
-                    // not branched on.
-                    hint::select_unpredictable(
-                        tag_type != 0,
-                        op_base.offset(delta) as *const u8,
-                        old_ip,
-                    )
-                };
-                mem_copy_64(op_base.offset(op), from, len as usize);
-                op += len;
+                    let delta = op + len_min_offset - len;
+                    let from = if delta < 0 {
+                        // A copy that starts before `dst`, or a literal: its
+                        // made-up offset gives it a negative `delta` while
+                        // `op` is below 256.
+                        hint::cold_path();
+                        if tag_type != 0 {
+                            ip = old_ip;
+                            break 'elements;
+                        }
+                        old_ip
+                    } else {
+                        // A copy takes its bytes from `dst`, a literal from
+                        // `src`; only the address differs, and it is
+                        // selected, not branched on.
+                        hint::select_unpredictable(
+                            tag_type != 0,
+                            op_base.offset(delta) as *const u8,
+                            old_ip,
+                        )
+                    };
+                    mem_copy_64(op_base.offset(op), from, len as usize);
+                    op += len;
+                }
                 if ip >= ip_limit_min_slop || op >= op_limit_min_slop {
                     break;
                 }
@@ -648,6 +670,270 @@ unsafe fn mem_copy_64(dst: *mut u8, src: *const u8, size: usize) {
             dst.add(SHORT_MEM_COPY),
             64 - SHORT_MEM_COPY,
         );
+    }
+}
+
+/// Writes 64 bytes at `dst` that continue the `offset` bytes before it as a
+/// repeating pattern, which is what a copy that overlaps its own output
+/// produces: copying 10 bytes from 3 back turns `abc` into `abcabcabcabca`.
+/// Returns false, having written nothing, when `offset` is zero.
+///
+/// # Safety
+///
+/// `dst[-offset..64]` must be readable and `dst[..64]` writable.
+#[inline(always)]
+unsafe fn copy_64_bytes_with_pattern_extension(
+    dst: *mut u8,
+    offset: usize,
+) -> bool {
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(target_arch = "x86_64", target_feature = "ssse3")
+    ))]
+    {
+        if offset <= 16 {
+            match offset {
+                0 => return false,
+                1 => {
+                    let pattern = v128::dup_char(*dst.sub(1));
+                    for i in 0..4 {
+                        v128::store_u(dst.add(16 * i), pattern);
+                    }
+                }
+                2 | 4 | 8 | 16 => {
+                    // 16 is a multiple of these pattern sizes, so every
+                    // block of 16 bytes is the same.
+                    let pattern = load_pattern(dst.sub(offset), offset);
+                    for i in 0..4 {
+                        v128::store_u(dst.add(16 * i), pattern);
+                    }
+                }
+                _ => {
+                    let (mut pattern, reshuffle_mask) =
+                        load_pattern_and_reshuffle_mask(
+                            dst.sub(offset),
+                            offset,
+                        );
+                    for i in 0..4 {
+                        v128::store_u(dst.add(16 * i), pattern);
+                        pattern = v128::shuffle(pattern, reshuffle_mask);
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(target_arch = "x86_64", target_feature = "ssse3")
+    )))]
+    {
+        if offset < 16 {
+            if offset == 0 {
+                return false;
+            }
+            // Extend the pattern to the first 16 bytes, a byte at a time
+            // because each may be one that this loop wrote.
+            for i in 0..16 {
+                *dst.add(i) = *dst.sub(offset).add(i);
+            }
+            // The smallest multiple of the pattern size above 16: a block
+            // that far back does not overlap the block being written.
+            let pattern_size = (16 / offset + 1) * offset;
+            for i in 1..4 {
+                ptr::copy_nonoverlapping(
+                    dst.add(16 * i).sub(pattern_size),
+                    dst.add(16 * i),
+                    16,
+                );
+            }
+            return true;
+        }
+    }
+    // Very rare: a pattern longer than a block. Each block is copied whole
+    // from `offset` back, which is behind the start of the block.
+    hint::cold_path();
+    for i in 0..4 {
+        ptr::copy_nonoverlapping(
+            dst.add(16 * i).sub(offset),
+            dst.add(16 * i),
+            16,
+        );
+    }
+    true
+}
+
+/// Shuffle control masks that turn 16 loaded bytes into the pattern of the
+/// first `pattern_size` of them, repeated: entry `pattern_size - 1` holds
+/// `i % pattern_size` at byte `i`. For a pattern of 6 bytes that is
+/// `0 1 2 3 4 5 0 1 2 3 4 5 0 1 2 3`.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "x86_64", target_feature = "ssse3")
+))]
+static PATTERN_GENERATION_MASKS: PatternMasks =
+    PatternMasks(make_pattern_masks(0));
+
+/// Shuffle control masks that rotate a block of a repeating pattern into
+/// the block that follows it: entry `pattern_size - 1` holds
+/// `(16 + i) % pattern_size` at byte `i`.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "x86_64", target_feature = "ssse3")
+))]
+static PATTERN_RESHUFFLE_MASKS: PatternMasks =
+    PatternMasks(make_pattern_masks(16));
+
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "x86_64", target_feature = "ssse3")
+))]
+#[repr(align(16))]
+struct PatternMasks([[u8; 16]; 16]);
+
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "x86_64", target_feature = "ssse3")
+))]
+const fn make_pattern_masks(index_offset: usize) -> [[u8; 16]; 16] {
+    let mut masks = [[0u8; 16]; 16];
+    let mut pattern_size = 1;
+    while pattern_size <= 16 {
+        let mut i = 0;
+        while i < 16 {
+            masks[pattern_size - 1][i] =
+                ((index_offset + i) % pattern_size) as u8;
+            i += 1;
+        }
+        pattern_size += 1;
+    }
+    masks
+}
+
+/// Loads 16 bytes at `src` and returns the first `pattern_size` of them,
+/// repeated to fill a vector.
+///
+/// # Safety
+///
+/// `src[..16]` must be readable and `pattern_size` must be in `1..=16`.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "x86_64", target_feature = "ssse3")
+))]
+#[inline(always)]
+unsafe fn load_pattern(src: *const u8, pattern_size: usize) -> v128::V128 {
+    let generation_mask = v128::load_u(
+        PATTERN_GENERATION_MASKS.0.get_unchecked(pattern_size - 1).as_ptr(),
+    );
+    v128::shuffle(v128::load_u(src), generation_mask)
+}
+
+/// Like `load_pattern`, and also returns the mask that turns one block of
+/// the pattern into the next: shuffling `abcdefabcdefabcd` with it gives
+/// `efabcdefabcdefab`.
+///
+/// # Safety
+///
+/// `src[..16]` must be readable and `pattern_size` must be in `1..=16`.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    all(target_arch = "x86_64", target_feature = "ssse3")
+))]
+#[inline(always)]
+unsafe fn load_pattern_and_reshuffle_mask(
+    src: *const u8,
+    pattern_size: usize,
+) -> (v128::V128, v128::V128) {
+    let pattern = load_pattern(src, pattern_size);
+    let reshuffle_mask = v128::load_u(
+        PATTERN_RESHUFFLE_MASKS.0.get_unchecked(pattern_size - 1).as_ptr(),
+    );
+    (pattern, reshuffle_mask)
+}
+
+/// A vector of 16 bytes and the four operations the pattern copy needs,
+/// with one name on every architecture that has a byte shuffle.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod v128 {
+    use std::arch::aarch64::{
+        uint8x16_t, vdupq_n_u8, vld1q_u8, vqtbl1q_u8, vst1q_u8,
+    };
+
+    pub type V128 = uint8x16_t;
+
+    /// # Safety
+    ///
+    /// `src[..16]` must be readable.
+    #[inline(always)]
+    pub unsafe fn load_u(src: *const u8) -> V128 {
+        vld1q_u8(src)
+    }
+
+    /// # Safety
+    ///
+    /// `dst[..16]` must be writable.
+    #[inline(always)]
+    pub unsafe fn store_u(dst: *mut u8, value: V128) {
+        vst1q_u8(dst, value)
+    }
+
+    /// Returns the vector whose byte `i` is byte `mask[i]` of `input`.
+    /// Every byte of `mask` must be below 16.
+    #[inline(always)]
+    pub fn shuffle(input: V128, mask: V128) -> V128 {
+        // SAFETY: this module is compiled only when NEON is enabled for the
+        // whole crate, and the instruction touches no memory.
+        unsafe { vqtbl1q_u8(input, mask) }
+    }
+
+    #[inline(always)]
+    pub fn dup_char(byte: u8) -> V128 {
+        // SAFETY: as in `shuffle`.
+        unsafe { vdupq_n_u8(byte) }
+    }
+}
+
+/// A vector of 16 bytes and the four operations the pattern copy needs,
+/// with one name on every architecture that has a byte shuffle.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+mod v128 {
+    use std::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_set1_epi8, _mm_shuffle_epi8,
+        _mm_storeu_si128,
+    };
+
+    pub type V128 = __m128i;
+
+    /// # Safety
+    ///
+    /// `src[..16]` must be readable.
+    #[inline(always)]
+    pub unsafe fn load_u(src: *const u8) -> V128 {
+        _mm_loadu_si128(src as *const __m128i)
+    }
+
+    /// # Safety
+    ///
+    /// `dst[..16]` must be writable.
+    #[inline(always)]
+    pub unsafe fn store_u(dst: *mut u8, value: V128) {
+        _mm_storeu_si128(dst as *mut __m128i, value)
+    }
+
+    /// Returns the vector whose byte `i` is byte `mask[i]` of `input`.
+    /// Every byte of `mask` must be below 16.
+    #[inline(always)]
+    pub fn shuffle(input: V128, mask: V128) -> V128 {
+        // SAFETY: this module is compiled only when SSSE3 is enabled for
+        // the whole crate, and the instruction touches no memory.
+        unsafe { _mm_shuffle_epi8(input, mask) }
+    }
+
+    #[inline(always)]
+    pub fn dup_char(byte: u8) -> V128 {
+        // SAFETY: SSE2 is part of every x86_64 target, and the instruction
+        // touches no memory.
+        unsafe { _mm_set1_epi8(byte as i8) }
     }
 }
 
