@@ -688,6 +688,15 @@ impl<'s, 'd> Decompress<'s, 'd> {
 /// computed and one is selected, so no branch has to guess the kind of the
 /// element, and the next tag is loaded here, before the element is copied.
 ///
+/// On aarch64 the chain is a load, the two bit operations that take the
+/// tag apart, the select and the next load, whose address is the sum of two
+/// registers: `ip` and the selected distance. For that the sum must have no
+/// other use, or the compiler computes it once, in an instruction of its
+/// own that the load then waits for. So the distance that `ip` moves by is
+/// selected a second time, as a value of its own, instead of being derived
+/// from the address of the next tag byte. That costs two instructions next
+/// to the chain and takes one off it.
+///
 /// For the two elements that leave `decompress_branchless` the result is not
 /// the next tag: a literal whose length follows the tag is treated as
 /// having the length its tag byte would encode (61 to 64), and a copy with a
@@ -699,10 +708,17 @@ impl<'s, 'd> Decompress<'s, 'd> {
 #[inline(always)]
 unsafe fn advance_to_next_tag(ip: &mut *const u8, tag: &mut usize) -> usize {
     let tag_type = *tag & 3;
+    let is_literal = tag_type == 0;
+    let literal_len = (*tag >> 2) + 1;
     let next_tag_offset =
-        if tag_type == 0 { (*tag >> 2) + 1 } else { tag_type };
+        hint::select_unpredictable(is_literal, literal_len, tag_type);
+    #[cfg(target_arch = "aarch64")]
+    let ip_advance =
+        hint::select_unpredictable(is_literal, literal_len + 1, tag_type + 1);
+    #[cfg(not(target_arch = "aarch64"))]
+    let ip_advance = next_tag_offset + 1;
     *tag = *ip.add(next_tag_offset) as usize;
-    *ip = ip.add(next_tag_offset + 1);
+    *ip = ip.add(ip_advance);
     tag_type
 }
 
